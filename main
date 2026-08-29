@@ -1,0 +1,239 @@
+#include <stdio.h> // C functions
+#include <string.h> // String functions
+#include <math.h> // Math functions
+#include "freertos/FreeRTOS.h" // RTOS Functionality
+#include "freertos/task.h" // Delay Tasks
+#include "esp_log.h" // ESP terminal logging
+#include "esp_adc/adc_continuous.h" // DMA continuous ADC sampling 
+#include "driver/gpio.h" // GPIO Functionality
+#include "ili9488.h" // ILI9488 Driver
+#include "pwm.h" // PWM Driver
+#include "esp_rom_sys.h" // Delay Tasks
+#include "esp_timer.h" // Timer
+#include "signal_processing.h" // Signal processing functions
+
+#define TAG "MAIN" // Terminal log file tag
+#define ADC_CHANNEL ADC_CHANNEL_6 // ADC1_6 Pinout - GPIO 34
+#define WAVEFORM_HEIGHT 200 // Oscope height
+#define WAVEFORM_VERT_OFFSET 50 // Top margin for Oscope stats
+
+#define BLACK 0x0000
+#define WHITE 0xFFFF
+#define CYAN 0x07FF // Trace
+#define RED 0xF800 // Grid
+
+#define SAMPLE_FREQ 50000 // 50 kHz sample rate
+#define ADC_FRAME_SAMPLES 256 // ADC readings per DMA frame
+#define READ_LENGTH (ADC_FRAME_SAMPLES * SOC_ADC_DIGI_RESULT_BYTES) // DMA buffer read size - aligned to SOC_ADC_DIGI
+#define MAX_SAMPLES (READ_LENGTH * 2 / sizeof(adc_digi_output_data_t)) // DMA safe full capacity
+
+static uint16_t prev_y[WIDTH]; // Set previous Y coordinate to ILI9488 width
+static uint16_t current_y[WIDTH]; // Set current Y coordinate to ILI9488 width
+static uint16_t filtered_adc[MAX_SAMPLES]; // Filtered ADC buffer
+
+void app_main (void)
+{
+    /* DMC ADC Initialization */ 
+
+    ESP_LOGI(TAG, "Initializing Continuous DMA ADC..."); 
+
+    adc_continuous_handle_t adc_handle = NULL; // Create ADC pointer
+    adc_continuous_handle_cfg_t adc_config =  // Main handle configuration
+    { 
+        .max_store_buf_size = READ_LENGTH * 2, // Set buffer to store 1-2 frames 
+        .conv_frame_size = READ_LENGTH, // bytes fetched per DMA interrupt
+    };    
+    ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &adc_handle)); // Create ADC instance
+
+    adc_digi_pattern_config_t adc_pattern[1] = // Clock configuration
+    {
+        {
+            .atten = ADC_ATTEN_DB_12, // 12db attenuation
+            .bit_width = ADC_BITWIDTH_12, // 12 bit ADAC
+            .unit = ADC_UNIT_1, // ADC unit 1
+            .channel = ADC_CHANNEL, // ADC channel 6 - GPIO 34
+        }
+    };
+
+    adc_continuous_config_t digital_config = // Pattern configuration
+    {
+        .pattern_num = 1, // Channel configuration 1
+        .adc_pattern = adc_pattern, // Channel configuration struct
+        .sample_freq_hz = SAMPLE_FREQ, // Set DMA sampling frequency
+        .conv_mode = ADC_CONV_SINGLE_UNIT_1, // Sample on ADC1
+        .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1, // ESP32 ADC formatting
+    };
+
+    ESP_ERROR_CHECK(adc_continuous_config(adc_handle, &digital_config)); // Apply settings to continuous ADAC
+    ESP_ERROR_CHECK(adc_continuous_start(adc_handle)); // Start DMA sampling
+
+    /* ILI9488 SPI Initialization */
+
+    ESP_LOGI(TAG, "Initializing ILI9488...");
+
+    ili9488_initialization();
+
+    ili9488_clear (BLACK); // Clear display
+    vTaskDelay(pdMS_TO_TICKS(10));
+    ili9488_draw_text (10, 30, "ESP32 OSCILLOSCOPE", WHITE, BLACK);
+    //ili9488_draw_text (10, 30, "ADC Pin: GPIO 34", RED, BLACK); 
+
+    ili9488_draw_line (0, WAVEFORM_VERT_OFFSET, WIDTH - 1, WAVEFORM_VERT_OFFSET, RED); // Boundary box
+    ili9488_draw_line (0, WAVEFORM_VERT_OFFSET + WAVEFORM_HEIGHT, WIDTH - 1, WAVEFORM_VERT_OFFSET + WAVEFORM_HEIGHT, RED); // Boundary box
+
+    for (int i = 0; i < WIDTH; i++) // Default baseline
+    {
+        prev_y[i] = WAVEFORM_VERT_OFFSET + (WAVEFORM_HEIGHT / 2); 
+    }
+
+    char text_buff[32]; // Character buffer array
+
+    /* PWM Initialization */
+
+    start_sine_wave_generator(); 
+
+    /* Main Loop */
+
+    uint8_t dma_bytes[READ_LENGTH * 2]; // DMA packet buffer
+    uint16_t raw_adc[MAX_SAMPLES]; // ADC samples
+
+    while (1)
+    {
+        uint32_t bytes_received = 0; // DMA bytes received counter
+
+        //adc_continuous_stop(adc_handle); // Flush stale ADC DMA buffer data
+        //adc_continuous_start(adc_handle); // Restart ADC
+
+        esp_err_t receival = adc_continuous_read(adc_handle, dma_bytes, sizeof(dma_bytes), &bytes_received, pdMS_TO_TICKS(10)); // Single blocking read with timeout 
+        
+        if (receival == ESP_OK && bytes_received > 0)
+        {
+            uint32_t sample_count = bytes_received / sizeof(adc_digi_output_data_t); // Calculate sample count
+            if (sample_count > MAX_SAMPLES)
+            {
+                sample_count = MAX_SAMPLES; // Bound sample count
+            }
+
+            for (int i = 0; i < sample_count; i++)
+            {
+                // Parse DMA raw bytes into 12 bit array
+                adc_digi_output_data_t *p = (adc_digi_output_data_t *)&dma_bytes[i * sizeof(adc_digi_output_data_t)]; 
+                raw_adc[i] = p->type1.data; // Extract 12 bit sample from raw DMA
+            }
+
+            filter_signal_ema(raw_adc, filtered_adc, sample_count); // ADC software filter
+
+            // Trigger
+            int trigger = 2048; // Center of 12-bit ADC
+            int index = 0; // Display alignment index
+            int edge_0 = -1; // First rising edge
+            int edge_1 = -1; // Second rising edge
+
+            // Scan frame for rising edge 
+            for (int i = 1; i < sample_count; i++)
+            {
+                if (filtered_adc[i - 1] < trigger && filtered_adc[i] >= trigger)
+                {
+                    if (edge_0 == -1)
+                    {
+                        index = i; // Align starting point of waveform
+                        edge_0 = i; // Log edge 
+                    }
+                    else if (edge_1 == -1)
+                    {
+                        edge_1 = i; // Log edge 2
+                        break; // Trigger found
+                    }
+                }
+            }
+
+            float calculated_freq = 0.0f; // Frequnency calculation variable
+            if (edge_0 != -1 && edge_1 != -1 && edge_1 > edge_0)
+            {
+                int period = edge_1 - edge_0; // Calculate period from delta of edges
+                float period_time = (float)period / (float)SAMPLE_FREQ; // Convert to seconds
+                if (period_time > 0.0f)
+                {
+                    calculated_freq = 1.0f / period_time; // Convert to Hz reading
+                }
+            }
+
+            int min_adc = 4095; // Minimum ADC
+            int max_adc = 0; // Max ADC
+
+            for (int i = 0; i < sample_count; i++)
+            {
+                if (filtered_adc[i] < min_adc)
+                {
+                    min_adc = filtered_adc[i]; // If in bounds, set minimum ADC value
+                }
+                if (filtered_adc[i] > max_adc)
+                {
+                    max_adc = filtered_adc[i]; // If in bounds, set maximum ADC value
+                }
+            }
+
+            float min = (min_adc / 4095.0f) * 3.3f; // Calculate minimum voltage
+            float max = (max_adc / 4095.0f) * 3.3f; // Calculate maximum voltage
+            float vpp = max - min; // Calculate Voltage peak-to-peak
+            float instant_volt = (filtered_adc[index] / 4095.0f) * 3.3f; // Calculate instantaneous voltage 
+
+            // Map ADC readings to Y coordinate plane
+            for (int x = 0; x < WIDTH; x++)
+            {
+                int sample_index = index + x;
+                if (sample_index >= sample_count)
+                {
+                    sample_index = sample_count - 1; // Overflow prevention
+                }
+
+                int y = WAVEFORM_VERT_OFFSET + WAVEFORM_HEIGHT - ((filtered_adc[sample_index] * WAVEFORM_HEIGHT) / 4095); // Map ADC to Y position
+
+                if (y < WAVEFORM_VERT_OFFSET) 
+                {
+                    y = WAVEFORM_VERT_OFFSET; // Clamp Y vertical bound
+                }
+                if (y >= WAVEFORM_VERT_OFFSET + WAVEFORM_HEIGHT)
+                {
+                    y = WAVEFORM_VERT_OFFSET + WAVEFORM_HEIGHT - 1; // Clamp Y vertical bound
+                }
+                current_y[x] = y; // Update Y coordinate
+            }
+
+            draw_scope_waveform(current_y, CYAN); // Render waveofrm with dirty vector erasing
+
+            /*for (int x = 0; x < WIDTH - 1; x++) // Erase and re-draw lines upon updating
+            {
+                ili9488_draw_line (x, prev_y[x], x + 1, prev_y[x + 1], BLACK); // Erase previous line
+                ili9488_draw_line (x, current_y[x], x + 1, current_y[x + 1], CYAN); // Draw next line
+                prev_y[x] = current_y[x]; // Update Y
+            }
+            prev_y[WIDTH - 1] = current_y[WIDTH - 1]; // Update ending coordinate
+            */
+            static float prev_vpp = -1.0f; // Previous voltage peak-to-peak 
+            static float prev_freq = -1.0f; // Previous frequency
+            static uint8_t frame_skip = 0; // Frame skipping counter
+
+            if (++frame_skip >= 10 || fabsf(vpp - prev_vpp) > 0.05f || fabsf(calculated_freq - prev_freq) > 50.0f) // Check update conditions
+            {
+                snprintf(text_buff, sizeof(text_buff), "V:%.2fV  Vpp:%.2fV", instant_volt, vpp);
+                ili9488_draw_text (10, 10, text_buff, CYAN, BLACK); // Print voltage and VPP
+
+                if (calculated_freq >= 1000.0f)
+                {
+                    snprintf(text_buff, sizeof(text_buff), "F:%.2fkHz ", calculated_freq / 1000.0f);
+                }
+                else
+                {
+                    snprintf(text_buff, sizeof(text_buff), "F:%.1fHz ", calculated_freq);
+                }
+                ili9488_draw_text (220, 10, text_buff, CYAN, BLACK); // Print voltage and VPP
+
+                prev_vpp = vpp; // Update voltage peak-to-peak;
+                prev_freq = calculated_freq; // Update frequency
+                frame_skip = 0; // Reset frame skip counter
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10)); // Delay 1 OS tick for watchdog
+    }
+}
