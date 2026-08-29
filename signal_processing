@@ -1,0 +1,17 @@
+#include <stdint.h> // Integers
+#include <stdbool.h> // Boolean logic
+#include <stddef.h> // Data types
+#include "signal_processing.h" // Header
+
+// Digital signal filter function (Until I acquire a Op-Amp)
+void filter_signal_ema(const uint16_t *raw_signal, uint16_t *filtered_signal, size_t count)
+{
+    float alpha = 0.25f; // Mid-level smoothing factor
+    float filtered = (float)raw_signal[0]; // Get raw signal
+
+    for (size_t i = 0; i < count; i++)
+    {
+        filtered += alpha * ((float)raw_signal[i] - filtered);
+        filtered_signal[i] = (uint16_t)filtered; 
+    }
+}
