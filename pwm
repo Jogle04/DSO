@@ -1,0 +1,86 @@
+#include "pwm.h" // PWM header
+#include <math.h> // Math functions
+#include "driver/ledc.h" // LED control
+#include "freertos/FreeRTOS.h" // RTOS 
+#include "freertos/task.h" // RTOS delay
+#include "esp_rom_sys.h" // Delay Tasks
+#include "esp_timer.h" // Hardware timer
+
+#define LEDC_TIMER LEDC_TIMER_0 // Hardware timer 0
+#define LEDC_MODE LEDC_LOW_SPEED_MODE // Set low speed PWM
+#define LEDC_CHANNEL LEDC_CHANNEL_0 // Select PWM channel 0
+#define LEDC_DUTY_RES LEDC_TIMER_8_BIT // Set resolution to 8 bit duty cycle
+#define LEDC_FREQ 50000 // Set 50 KHz frequency
+
+static uint32_t sine_table[SINE]; // Allocate memory to sine values
+
+static void generate_sine_table(void)
+{
+    uint32_t max_duty = (1 << 8) - 1; // Max 8 bit duty cycle
+    
+    for (int i = 0; i < SINE; i++)
+    {
+        double rad = (2.0 * M_PI * i) / SINE; // Compute angle in radians
+        double val = (sin(rad) + 1.0) / 2.0; // Calculate sine value
+        sine_table[i] = (uint32_t)(val * max_duty); // Scale float
+    }
+}
+
+void pwm_initialization(void)
+{
+    generate_sine_table(); // Populate sine values
+
+    ledc_timer_config_t timer = // Configure LEDC timer
+    {
+        .speed_mode = LEDC_MODE, // Set low speed
+        .timer_num = LEDC_TIMER, // Select TIMER0
+        .duty_resolution = LEDC_DUTY_RES, // Set duty cycle to 8 bits
+        .freq_hz = LEDC_FREQ, // Set frequency
+        .clk_cfg = LEDC_AUTO_CLK, // Set ESP32 clock
+    };
+    ESP_ERROR_CHECK (ledc_timer_config(&timer)); // Pass configuration 
+
+    ledc_channel_config_t channel = // Configure PWM channel
+    {
+        .speed_mode = LEDC_MODE, // Set low speed
+        .channel = LEDC_CHANNEL, // Select channel 0
+        .timer_sel = LEDC_TIMER, // Select timer 0
+        .intr_type = LEDC_INTR_DISABLE, // Disable interrupt triggers
+        .gpio_num = PWM, // Set GPIO 17 for PWM
+        .duty = sine_table[0], // Set initial duty cycle output
+        .hpoint = 0, // Set initial phase count
+    };
+    ESP_ERROR_CHECK (ledc_channel_config(&channel)); // Pass configuration
+}
+
+static int sample_index = 0; // Sample index
+
+// PWM Sine wave setup function, callback from IRAM
+static void IRAM_ATTR sine_wave_timer_cb(void *arg)
+{
+    ledc_set_duty_with_hpoint (LEDC_MODE, LEDC_CHANNEL, sine_table[sample_index], 0); // Write duty cycle from sine table
+    ledc_update_duty (LEDC_MODE, LEDC_CHANNEL); // Apply register changes
+    sample_index++; // Increment sample index
+
+    if (sample_index >= SINE)
+    {
+        sample_index = 0; // Keep sample index within SINE bounds
+    }
+}
+
+void start_sine_wave_generator(void)
+{
+    pwm_initialization(); // Initialize PWM
+
+    const esp_timer_create_args_t timer_args = // Timer struct
+    {
+        .callback = &sine_wave_timer_cb,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "sine_wave_timer",
+    };
+    esp_timer_handle_t timer_handle; // Handle
+
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &timer_handle)); // Create timer
+    ESP_ERROR_CHECK(esp_timer_start_periodic(timer_handle, 10)); // Run timer periodically every 10 us
+}
