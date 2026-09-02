@@ -40,7 +40,7 @@ void app_main (void)
     adc_continuous_handle_t adc_handle = NULL; // Create ADC pointer
     adc_continuous_handle_cfg_t adc_config =  // Main handle configuration
     { 
-        .max_store_buf_size = READ_LENGTH * 2, // Set buffer to store 1-2 frames 
+        .max_store_buf_size = READ_LENGTH, // Set buffer to store 1-2 frames 
         .conv_frame_size = READ_LENGTH, // bytes fetched per DMA interrupt
     };    
     ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &adc_handle)); // Create ADC instance
@@ -100,13 +100,19 @@ void app_main (void)
     while (1)
     {
         uint32_t bytes_received = 0; // DMA bytes received counter
+        uint32_t temp_bytes = 0; // Newest bytes received
 
-        //adc_continuous_stop(adc_handle); // Flush stale ADC DMA buffer data
-        //adc_continuous_start(adc_handle); // Restart ADC
+        esp_err_t receival = adc_continuous_read(adc_handle, dma_bytes, sizeof(dma_bytes), &bytes_received, pdMS_TO_TICKS(1)); // Single blocking read with timeout 
 
-        esp_err_t receival = adc_continuous_read(adc_handle, dma_bytes, sizeof(dma_bytes), &bytes_received, pdMS_TO_TICKS(10)); // Single blocking read with timeout 
+        while (adc_continuous_read(adc_handle, dma_bytes, sizeof(dma_bytes), &temp_bytes, 0) == ESP_OK) // Single blocking read with timeout 
+        {
+            if (temp_bytes > 0)
+            {
+                bytes_received = temp_bytes; // Overwrite with newest bytes
+            }
+        }
         
-        if (receival == ESP_OK && bytes_received > 0)
+        if (bytes_received > 0)
         {
             uint32_t sample_count = bytes_received / sizeof(adc_digi_output_data_t); // Calculate sample count
             if (sample_count > MAX_SAMPLES)
@@ -126,6 +132,7 @@ void app_main (void)
             // Trigger
             int trigger = 2048; // Center of 12-bit ADC
             int index = 0; // Display alignment index
+            bool trigger_found = false; // Rising edge trigger
             int edge_0 = -1; // First rising edge
             int edge_1 = -1; // Second rising edge
 
@@ -134,7 +141,7 @@ void app_main (void)
             {
                 if (filtered_adc[i - 1] < trigger && filtered_adc[i] >= trigger)
                 {
-                    if (edge_0 == -1)
+                    /*if (edge_0 == -1)
                     {
                         index = i; // Align starting point of waveform
                         edge_0 = i; // Log edge 
@@ -143,8 +150,16 @@ void app_main (void)
                     {
                         edge_1 = i; // Log edge 2
                         break; // Trigger found
-                    }
+                    }*/
+                    index = i; // Set index
+                    trigger_found = true; // Indicate found rising edge trigger
+                    break; // Synchronize to rising edge
                 }
+            }
+
+            if (!trigger_found)
+            {
+                index = 0; // if no trigger found, start at sample 0
             }
 
             float calculated_freq = 0.0f; // Frequnency calculation variable
@@ -178,10 +193,17 @@ void app_main (void)
             float vpp = max - min; // Calculate Voltage peak-to-peak
             float instant_volt = (filtered_adc[index] / 4095.0f) * 3.3f; // Calculate instantaneous voltage 
 
+            // Floating point step ratio
+            float step = (float)(sample_count - 1 - index) / (float)(WIDTH);
+            if (step <= 0.0f)
+            {
+                step = 1.0f; 
+            }
+
             // Map ADC readings to Y coordinate plane
             for (int x = 0; x < WIDTH; x++)
             {
-                int sample_index = index + x;
+                int sample_index = index + (int)(x * step);
                 if (sample_index >= sample_count)
                 {
                     sample_index = sample_count - 1; // Overflow prevention
@@ -214,8 +236,8 @@ void app_main (void)
             static float prev_freq = -1.0f; // Previous frequency
             static uint8_t frame_skip = 0; // Frame skipping counter
 
-            if (++frame_skip >= 10 || fabsf(vpp - prev_vpp) > 0.05f || fabsf(calculated_freq - prev_freq) > 50.0f) // Check update conditions
-            {
+            //if (++frame_skip >= 10 || fabsf(vpp - prev_vpp) > 0.05f || fabsf(calculated_freq - prev_freq) > 50.0f) // Check update conditions
+            //{
                 snprintf(text_buff, sizeof(text_buff), "V:%.2fV  Vpp:%.2fV", instant_volt, vpp);
                 ili9488_draw_text (10, 10, text_buff, CYAN, BLACK); // Print voltage and VPP
 
@@ -232,8 +254,9 @@ void app_main (void)
                 prev_vpp = vpp; // Update voltage peak-to-peak;
                 prev_freq = calculated_freq; // Update frequency
                 frame_skip = 0; // Reset frame skip counter
-            }
+            //}
         }
-        vTaskDelay(pdMS_TO_TICKS(10)); // Delay 1 OS tick for watchdog
+        //vTaskDelay(pdMS_TO_TICKS(10)); // Delay 1 OS tick for watchdog
+        vTaskDelay(1); 
     }
 }
