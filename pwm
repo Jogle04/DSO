@@ -82,5 +82,5 @@ void start_sine_wave_generator(void)
     esp_timer_handle_t timer_handle; // Handle
 
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &timer_handle)); // Create timer
-    ESP_ERROR_CHECK(esp_timer_start_periodic(timer_handle, 10)); // Run timer periodically every 10 us
+    ESP_ERROR_CHECK(esp_timer_start_periodic(timer_handle, 55)); // Run timer periodically every 10 us
 }
